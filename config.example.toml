@@ -1,0 +1,19 @@
+[modbus]
+port = "/dev/ttyUSB0"
+baudrate = 9600
+slave_id = 1
+start_register = 0
+count = 2
+timeout_seconds = 0.5
+poll_seconds = 2.0
+
+[mqtt]
+host = "127.0.0.1"
+port = 1883
+topic = "lab/gateway/telemetry"
+client_id = "industrial-gateway-demo"
+# username = ""
+# password = ""
+
+[storage]
+path = "gateway.sqlite3"
