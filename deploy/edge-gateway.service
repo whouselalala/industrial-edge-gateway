@@ -1,0 +1,17 @@
+[Unit]
+Description=Industrial Modbus RTU to MQTT gateway
+After=network.target
+
+[Service]
+DynamicUser=yes
+SupplementaryGroups=dialout
+StateDirectory=edge-gateway
+Environment=SERIAL=/dev/ttyUSB0 MQTT_HOST=127.0.0.1 MQTT_PORT=1883 MQTT_TOPIC=lab/gateway/telemetry
+EnvironmentFile=-/etc/default/edge-gateway
+ExecStart=/usr/local/bin/edge-gateway ${SERIAL} /var/lib/edge-gateway/outbox.sqlite3 ${MQTT_HOST} ${MQTT_PORT} ${MQTT_TOPIC}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

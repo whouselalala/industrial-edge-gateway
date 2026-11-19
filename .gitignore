@@ -5,3 +5,4 @@ __pycache__/
 config.toml
 .idea/
 .vscode/
+/linux/edge-gateway

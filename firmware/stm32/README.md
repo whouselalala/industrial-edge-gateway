@@ -9,3 +9,7 @@
 5. 根据芯片实际 UART/DMA 引脚配置补充 `board.c`、接线图和实机日志。不同 HAL 版本与 MCU 型号的回调细节不可直接假定相同。
 
 网关本身部署于 Linux 主机，通过 USB-RS485 连接 STM32 从站；无需在 MCU 上移植 MQTT、SQLite 或 Python。
+
+## 配合 Linux C 主程序
+
+上面第 2 步的地址 0 对应旧 Python 配置。新的 Linux 主站按参考设备使用以下映射：温湿度节点设 address=1，registers[1] 存温度 ×10，registers[2] 存湿度 ×10；光照节点设 address=2，registers[2]、registers[3] 分别存照度（千分之一 lux）的高、低 16 位。每块从站板使用自己的地址；若单块 STM32 同时采集两个传感器，可维护两个 mb_slave_t 快照，按请求首字节选择快照，再调用 mb_handle。硬件采样驱动取决于所选传感器型号。
