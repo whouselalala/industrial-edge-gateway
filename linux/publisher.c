@@ -1,110 +1,131 @@
 #include "gateway.h"
+
 #include <mosquitto.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-sqlite3 *open_store(const char *path) {
-    sqlite3 *db = NULL;
-    int rc = sqlite3_open(path, &db);
-    if (rc == SQLITE_OK) {
-        /* 两个线程各自打开同一数据库文件。遇到锁最多等待 5000 ms；WAL 允许读写并行，写入仍串行。 */
-        sqlite3_busy_timeout(db, 5000);
-        rc = sqlite3_exec(db, "PRAGMA journal_mode=WAL;"
-            "CREATE TABLE IF NOT EXISTS outbox("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,ts INTEGER NOT NULL,"
-            "slave INTEGER NOT NULL,fields TEXT NOT NULL)", NULL, NULL, NULL);
-    }
-    if (rc == SQLITE_OK) return db;
-    fprintf(stderr, "open outbox: %s\n", sqlite3_errmsg(db));
-    sqlite3_close(db);
-    return NULL;
-}
-
-/* mid 是本次 MQTT 发布的报文标识，acknowledged 表示收到相应确认；数据库样本另有持久 ID。 */
 struct delivery {
+    int connack;
     int mid;
     bool acknowledged;
 };
 
-/* QoS 1 确认回调：client 为当前客户端，userdata 指向本次连接的 delivery，mid 由库传回。 */
-static void on_publish(struct mosquitto *client, void *userdata, int mid) {
+static void on_connect(struct mosquitto *client, void *userdata, int code) {
     (void)client;
-    struct delivery *delivery = userdata;
-    if (mid == delivery->mid) delivery->acknowledged = true;
+    struct delivery *state = userdata;
+    state->connack = code;
 }
 
-/* client：当前 MQTT 客户端；delivery：当前在途消息的确认状态。
- * db：上传线程自己的 SQLite 连接；topic：目标主题。
- * 按样本 ID 从小到大发送。返回 -1 表示数据库或组包错误；
- * 返回 0 表示本轮结束（包括断线、未收到确认或停止），积压记录下次继续处理。
+static void on_publish(struct mosquitto *client, void *userdata, int mid) {
+    (void)client;
+    struct delivery *state = userdata;
+    if (mid == state->mid) state->acknowledged = true;
+}
+
+/* 处理 MQTT socket 和心跳。timeout_ms 是每次等待网络事件的上限。 */
+static bool pump(struct mosquitto *client, int timeout_ms) {
+    if (stopping()) return false;
+    int rc = mosquitto_loop(client, timeout_ms, 1);
+    publisher_progress();
+    return rc == MOSQ_ERR_SUCCESS;
+}
+
+static bool await_connack(struct mosquitto *client, struct delivery *state) {
+    int64_t deadline = monotonic_ms() + 5000;
+    while (state->connack < 0 && monotonic_ms() < deadline)
+        if (!pump(client, 100)) return false;
+    return state->connack == 0;
+}
+
+/* FIFO 发送。样本先落盘，只有收到对应报文的 PUBACK 才删除这一行。
+ * 这样断电或断线后可以重试。确认前后发生中断时 QoS 1 允许重复投递。
  */
-static int drain(struct mosquitto *client, struct delivery *delivery,
-                 sqlite3 *db, const char *topic) {
+static void drain(struct mosquitto *client, struct delivery *state, sqlite3 *db,
+                  const char *topic) {
     sqlite3_stmt *next = NULL, *remove = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT id,ts,slave,fields FROM outbox ORDER BY id LIMIT 1",
-                           -1, &next, NULL) != SQLITE_OK ||
-        sqlite3_prepare_v2(db, "DELETE FROM outbox WHERE id=?", -1, &remove, NULL) != SQLITE_OK)
-        goto database_error;
-    while (!stopping()) {
-        int rc = sqlite3_step(next);
-        /* 查询返回 DONE 表示目前没有待发记录。空闲时仍运行 MQTT 网络循环，处理心跳与断线。 */
-        if (rc == SQLITE_DONE) {
-            sqlite3_reset(next);
-            if (mosquitto_loop(client, 100, 1) != MOSQ_ERR_SUCCESS) break;
+    int rc = sqlite3_prepare_v2(db, "SELECT id,payload FROM samples ORDER BY id LIMIT 1",
+                                -1, &next, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_prepare_v2(db, "DELETE FROM samples WHERE id=?", -1, &remove, NULL);
+    unsigned sent = 0;
+    int64_t next_batch = 0;
+    while (rc == SQLITE_OK && !stopping()) {
+        if (monotonic_ms() < next_batch) {
+            if (!pump(client, 100)) break;
             continue;
         }
-        if (rc != SQLITE_ROW) goto database_error;
+        int row = sqlite3_step(next);
+        if (row == SQLITE_DONE) {
+            sqlite3_reset(next);
+            sent = 0;
+            if (!pump(client, 100)) break;
+            continue;
+        }
+        if (row != SQLITE_ROW) {
+            rc = row;
+            break;
+        }
         sqlite3_int64 id = sqlite3_column_int64(next, 0);
-        /* 取出时间、从站和测量字段，连同持久 ID 组成 JSON；之后可释放本次查询的读快照。 */
-        char *payload = sqlite3_mprintf("{\"id\":%lld,\"ts\":%lld,\"slave\":%d,%s}",
-            id, sqlite3_column_int64(next, 1), sqlite3_column_int(next, 2),
-            sqlite3_column_text(next, 3));
+        const unsigned char *payload = sqlite3_column_text(next, 1);
+        int length = sqlite3_column_bytes(next, 1);
+        state->acknowledged = false;
+        int published = mosquitto_publish(client, &state->mid, topic, length, payload, 1, false);
         sqlite3_reset(next);
-        if (!payload) goto database_error;
-        delivery->acknowledged = false;
-        /* &mid 接收本次报文标识；长度单位为字节，1 表示 QoS 1，false 表示不设置保留消息标志。 */
-        rc = mosquitto_publish(client, &delivery->mid, topic, (int)strlen(payload),
-                               payload, 1, false);
-        sqlite3_free(payload);
-        if (rc != MOSQ_ERR_SUCCESS) break;
-        /* publish 成功只表示库接受了发送请求。循环处理网络事件，每次最多等待 100 ms，由回调识别 PUBACK。 */
-        for (int i = 0; i < 100 && !delivery->acknowledged && !stopping(); ++i)
-            if (mosquitto_loop(client, 100, 1) != MOSQ_ERR_SUCCESS) break;
-        if (!delivery->acknowledged) break;
-        /* 仅确认后按数据库 ID 删除。若确认后、删除前掉电，同一 ID 会再发一次，订阅端可据此去重。 */
+        if (published != MOSQ_ERR_SUCCESS) break;
+
+        int64_t deadline = monotonic_ms() + 5000;
+        while (!state->acknowledged && monotonic_ms() < deadline)
+            if (!pump(client, 100)) break;
+        if (!state->acknowledged) break;
+
         sqlite3_bind_int64(remove, 1, id);
-        if (sqlite3_step(remove) != SQLITE_DONE) goto database_error;
+        int deleted = sqlite3_step(remove);
+        if (deleted != SQLITE_DONE) {
+            rc = deleted;
+            break;
+        }
         sqlite3_reset(remove);
+        if (++sent == REPLAY_BATCH) {
+            next_batch = monotonic_ms() + POLL_MS;
+            sent = 0;
+        }
     }
+    if (rc != SQLITE_OK) fprintf(stderr, "MQTT 队列: %s\n", sqlite3_errmsg(db));
     sqlite3_finalize(next);
     sqlite3_finalize(remove);
-    return 0;
-database_error:
-    fprintf(stderr, "read/update outbox: %s\n", sqlite3_errmsg(db));
-    sqlite3_finalize(next);
-    sqlite3_finalize(remove);
-    return -1;
 }
 
 void *publish_loop(void *argument) {
-    struct publisher_config *cfg = argument;
-    sqlite3 *db = NULL;
+    const struct publisher_config *config = argument;
+    bool offline_reported = false;
     while (!stopping()) {
-        if (!db) db = open_store(cfg->database);
-        struct delivery delivery = {0};
-        /* NULL 让库生成客户端 ID，true 开启干净会话，&delivery 作为 userdata 交给回调。 */
-        struct mosquitto *client = mosquitto_new(NULL, true, &delivery);
+        publisher_progress();
+        sqlite3 *db = open_store(config->database);
+        struct delivery state = {.connack = -1};
+        struct mosquitto *client = mosquitto_new(config->client_id, true, &state);
         if (db && client) {
+            mosquitto_int_option(client, MOSQ_OPT_PROTOCOL_VERSION, MQTT_PROTOCOL_V311);
+            mosquitto_connect_callback_set(client, on_connect);
             mosquitto_publish_callback_set(client, on_publish);
-            /* 最后一项 20 是 MQTT 保活间隔（秒）。每轮连接结束后重建客户端，积压记录仍在 SQLite 中。 */
-            int rc = mosquitto_connect(client, cfg->host, cfg->port, 20);
-            if (rc == MOSQ_ERR_SUCCESS) drain(client, &delivery, db, cfg->topic);
-            if (!stopping()) fprintf(stderr, "MQTT unavailable, retrying\n");
+            int rc = mosquitto_connect(client, config->host, config->port, 120);
+            publisher_progress();
+            if (rc == MOSQ_ERR_SUCCESS && await_connack(client, &state) &&
+                mosquitto_subscribe(client, NULL, config->topic, 1) == MOSQ_ERR_SUCCESS &&
+                set_mqtt_status(db, true) == 0) {
+                log_event(db, "INFO", "MQTT 已连接");
+                offline_reported = false;
+                drain(client, &state, db, config->topic);
+                set_mqtt_status(db, false);
+                mosquitto_disconnect(client);
+            }
+            if (!stopping() && !offline_reported) {
+                log_event(db, "WARN", "MQTT 离线，等待重连");
+                offline_reported = true;
+            }
         }
         if (client) mosquitto_destroy(client);
-        pause_ms(2000);
+        sqlite3_close(db);
+        publisher_progress();
+        pause_ms(RECONNECT_MS);
     }
-    sqlite3_close(db);
     return NULL;
 }

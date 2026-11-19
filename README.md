@@ -1,69 +1,86 @@
-# 基于 Linux 的工业物联网边缘网关
+# 工业物联网边缘网关 V2.0 · Linux 主机
 
-Linux 主机通过 USB-RS485 轮询温湿度和光照从站。C 程序将每次成功读取的样本写入 SQLite，独立线程通过 MQTT QoS 1 上传。适合在 Linux PC、树莓派或带 USB 主机接口的 ARM Linux 板上运行；目前验证平台为 x86-64 Linux。
+基于 [zgd-dev/-V2.0](https://github.com/zgd-dev/-V2.0/tree/40b4460e1f576e0f8223338f06698bc6bdd1bf90) 的 STM32 主机移植。Linux 设备通过自动收发的 USB–RS485 转接器连接原有温湿度和光照从站，再通过 Linux 网络接入巴法云。上游工程提供的是网关主机固件，温湿度和光照设备是外接从站。
 
-## 接线与寄存器
+## 从站接线与协议
 
-USB-RS485 适配器选自动收发方向型号，使用 9600 baud、8N1。可连接两个协议兼容的商用传感器，也可以用 STM32 作为采集节点，在采集任务中读取传感器并更新下表寄存器。仓库含 STM32 从站协议核心与移植说明，板级采样和接线仍需按具体硬件完成。
+把两台从站接回同一条 RS485 总线，A 接 A、B 接 B。串口参数为 **9600、8N1**，两台设备都使用功能码 **0x03** 读保持寄存器。
 
-| 从站地址 | 功能码 | 起始地址（线上零基地址） | 两个 16 位寄存器的含义 |
-|---|---|---|---|
-| 1 | 0x03 | 0x0001 | 有符号温度 ×10、无符号相对湿度 ×10 |
-| 2 | 0x03 | 0x0002 | 光照 ×1000，高 16 位在前，换算为 lux |
+| 设备 | 从站地址 | 起始寄存器（零基） | 数量 | 解析 |
+|---|---:|---:|---:|---|
+| 温湿度 | 1 | 0x0001 | 2 | 第一字温度、第二字湿度，按原主机的无符号数值各除以 10 |
+| 光照 | 2 | 0x0002 | 2 | 高字在前，拼成 32 位无符号数后整除 1000，单位 lx |
 
-任一节点超时或 CRC 错误时跳过该样本，继续轮询另一节点。两站都失败时重新打开串口。每轮休眠 2 秒。两个从站分别发布样本，避免离线设备的旧值混入当前读数。
+每台设备读完留出 30 ms 间隔，一轮结束后等待 800 ms。从站超时或 CRC 错误时保留上次读数，页面同时显示从站离线。两台都失败时重开串口。
 
-## 编译运行
+## MQTT 兼容
 
-在 Debian / Ubuntu 上，从仓库根目录执行。示例将 broker 与网关部署在同一台机器。
+默认服务器 `bemfa.com:9501`，发布和订阅主题为 `stm32`，发布使用 QoS 1。把你自己的巴法云私钥作为 `GATEWAY_MQTT_CLIENT_ID` 配置，并在巴法云控制台创建对应主题。见 [巴法云 MQTT 接入文档](https://cloud.bemfa.com/docs/src/mqtt.html)。
+
+| 原主机路径 | 保留的消息示例 |
+|---|---|
+| 在线直报 | `{{"temp":23.5,"humi":56.7,"light":123}}` |
+| 离线缓存补传 | `{"temperature":23.5,"shidu":56.7,"light":123}` |
+
+在线样例的双花括号来自原始 `model/modbus.c`，属于原有的 MQTT 文本格式。离线报文对应原始 `code/Taskhandel.c` 的 Flash 缓存路径。
+
+样本由 C 采集线程写入 SQLite，MQTT 工作线程按顺序发送。重连后每批最多补传 5 条，收到 PUBACK 后才删除对应记录，后续批次会继续发送积压。断电发生在确认与删除之间时，同一条记录可能重复投递。缓存和运行日志各自循环淘汰最早记录，条数上限按原来的 4 MiB 分区折算。SQLite 数据库文件大小取决于页和 WAL 开销。
+
+## 编译与本地运行
+
+适用于装有 systemd 的 Debian / Ubuntu。以下命令在仓库根目录运行。
 
 ```sh
-sudo apt install build-essential libmodbus-dev libsqlite3-dev libmosquitto-dev mosquitto mosquitto-clients
+sudo apt install build-essential libmodbus-dev libmosquitto-dev libsqlite3-dev libsystemd-dev python3
 make -C linux
-sudo systemctl start mosquitto
-mosquitto_sub -h 127.0.0.1 -q 1 -t lab/gateway/telemetry -v
+ls /dev/serial/by-id/
+read -rsp '巴法云私钥: ' GATEWAY_MQTT_CLIENT_ID; printf '\n'
+export GATEWAY_MQTT_CLIENT_ID
+./linux/edge-gateway /dev/ttyUSB0
 ```
 
-另开终端启动网关，当前账号需有串口读写权限。五个参数依次为串口、数据库文件、MQTT 主机、端口、主题。
+如果普通用户无法打开串口，用 `sudo usermod -aG dialout "$USER"` 加入串口组后重新登录。另开一个终端启动监控页面。
 
 ```sh
-./linux/edge-gateway /dev/ttyUSB0 outbox.sqlite3 127.0.0.1 1883 lab/gateway/telemetry
+python3 ui/server.py gateway.sqlite3
 ```
 
-消息示例：
+同一台 Linux 设备上的浏览器访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)。页面包含实时读数、从站和 MQTT 状态、运行时间及倒序日志。10 秒空闲时页面变黑，可触摸、按键或由新采样唤醒。原 SPI 屏、触摸驱动和背光控制属于 STM32 主机外设。Linux 版用浏览器承载这些界面功能，变黑仅发生在页面层。
 
-```json
-{"id":1,"ts":1700000000,"slave":1,"temperature_c":-12.3,"humidity_pct":56.7}
-{"id":2,"ts":1700000000,"slave":2,"illuminance_lux":123.456}
-```
+| 参数 | 含义 | 默认值 |
+|---|---|---|
+| 第一个位置参数 | Linux 串口设备路径 | 必填 |
+| `GATEWAY_DATABASE` | SQLite 文件位置 | `gateway.sqlite3` |
+| `GATEWAY_MQTT_HOST` | MQTT Broker 地址 | `bemfa.com` |
+| `GATEWAY_MQTT_PORT` | MQTT TCP 端口 | `9501` |
+| `GATEWAY_MQTT_TOPIC` | MQTT 主题 | `stm32` |
+| `GATEWAY_MQTT_CLIENT_ID` | 巴法云私钥或本地 Broker 客户端 ID | 空时由库生成 |
 
-## 离线缓存与服务管理
+也可显式传入参数，例如 `./linux/edge-gateway /dev/ttyUSB0 gateway.sqlite3 127.0.0.1 1883 stm32`。客户端 ID 仍从环境读取。
 
-采集线程与上传线程各用一个 SQLite 连接，通过 WAL 模式并发访问同一数据库。发布线程按 ID 顺序发送，每次仅保留一条在途消息，收到对应 PUBACK 后删除记录。连接中断或进程重启后继续读取未确认记录。若 broker 已接收而本地删除前掉电，重发可能产生重复，订阅端可按网关标识（部署时分配独立主题）和样本 ID 去重。当前 C 版面向本地或受控网络的匿名 MQTT broker，缓存容量取决于可用磁盘空间。
-
-在使用 systemd 和 dialout 组的设备上部署：
+## systemd 部署
 
 ```sh
-sudo install -m 755 linux/edge-gateway /usr/local/bin/
-sudo install -m 644 deploy/edge-gateway.service /etc/systemd/system/
+getent passwd edge-gateway >/dev/null || sudo useradd --system --user-group --no-create-home edge-gateway
+sudo install -m 0755 linux/edge-gateway /usr/local/bin/edge-gateway
+sudo install -d /usr/local/share/edge-gateway
+sudo install -m 0644 ui/server.py ui/index.html /usr/local/share/edge-gateway/
+sudo install -m 0644 deploy/*.service /etc/systemd/system/
+sudo install -m 0600 deploy/edge-gateway.conf.example /etc/edge-gateway.conf
+sudoedit /etc/edge-gateway.conf
 sudo systemctl daemon-reload
-sudo systemctl enable --now edge-gateway
-journalctl -u edge-gateway -f
+sudo systemctl enable --now edge-gateway.service edge-gateway-ui.service
+journalctl -u edge-gateway.service -f
 ```
 
-服务默认使用 /dev/ttyUSB0 和本机 broker，数据库位于 /var/lib/edge-gateway/outbox.sqlite3。可在 /etc/default/edge-gateway 设置 SERIAL、MQTT_HOST、MQTT_PORT、MQTT_TOPIC 后重启服务。串口建议使用 /dev/serial/by-id/ 下的稳定名称。
+网关通过 systemd 的 20 s 服务看门狗检测采集或网络线程卡死，超时会重启网关进程。数据库保存在 `/var/lib/edge-gateway`。查看两个线程的实现从 `linux/main.c` 和 `linux/publisher.c` 开始，`linux/store.c` 负责样本、日志和界面状态。
 
-## 验证与参考
-
-以下集成测试用 Linux 伪终端模拟两个 Modbus 从站，自动启动本地 Mosquitto，检查寄存器解码、坏 CRC 丢弃、离线采集、进程重启后的补传，以及 broker 中断后的自动恢复。需先安装上述依赖和 Python 3。
+## 测试
 
 ```sh
+sudo apt install mosquitto mosquitto-clients
 make -C linux
-PYTHONPATH=. python3 tests/linux/e2e.py
-python3 -m unittest discover -s tests -v
-cc -std=c11 -Wall -Wextra -Werror -Ifirmware/core firmware/core/modbus_slave.c tests/test_modbus_slave.c -o /tmp/test-slave && /tmp/test-slave
+python3 tests/e2e.py
 ```
 
-功能和寄存器映射参考 [zgd-dev 的工业边缘网关 V2.0](https://github.com/zgd-dev/-V2.0/tree/40b4460e1f576e0f8223338f06698bc6bdd1bf90)。Linux 端独立实现双从站采集、缓存、重连与日志；服务托管使用 systemd。原项目的 LVGL 触摸屏、息屏和 MCU 硬件看门狗未移植。
-
-[STM32 从站移植说明](firmware/stm32/README.md) · [原 Python 网关运行说明](gateway/README.md)。旧版的 TOML 配置、数据库与启动命令仍可使用。C 版使用独立的 outbox 表；从 Python 版切换前，应先用旧程序发完旧库中的积压记录。当前尚未做 ARM 板、STM32 真板或物理 RS485 总线联调。
+测试使用 Linux 伪终端模拟两个从站，用本地 Mosquitto 验证在线报文、断线缓存、进程重启后的补传和重新连接。还会检查监控 API 及看门狗通知。

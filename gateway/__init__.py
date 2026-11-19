@@ -1,1 +1,0 @@
-"""Linux industrial gateway demo."""
